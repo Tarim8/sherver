@@ -1,0 +1,642 @@
+#!/bin/bash
+
+# Sherver - bash script web server with Common Gateway Interface
+#
+# Copyright Tarim 2016,2017
+#
+# Sherver is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Sherver is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with Sherver.  If not, see <http://www.gnu.org/licenses/>.
+
+# Sherver is a bash script web server mainly for CGI scripts
+# Not secured - intended for localhost use on networks with no outside access
+# Generally a silly idea all round
+
+
+
+#
+# usage
+#
+usage() {
+    cat >&2 <<-EOH
+	Usage:
+	  ${whoami} [--help|--version]
+	  ${whoami} [status|stop] [MATCHING_ARGS]
+	  ${whoami} [PORT] [ROOT_DIR] [OPTIONS...]
+
+	Options:
+	  --config CONFIG_FILE          # read config file
+	  --virtual-host DEFAULT_NAME   # default name for virtual hosts
+	  --cgi-bin CGI_PATTERN         # CGI match pattern
+	  --index-page INDEX_FILE       # directory index file
+	  --error-pages ERROR_PREFIX    # user defined error files
+	  --time-out SECONDS            # client time-out in seconds
+	  --keep-alive                  # don't send Connection: close
+	  --remote                      # set REMOTE_ADDR, REMOTE_PORT
+	  --server                      # set HTTP Server
+	  --content-type                # set HTTP Content-Type
+	  --last-modified               # set HTTP Last-Modified
+	  --date                        # set HTTP Date
+	EOH
+}
+
+
+
+#
+# example local cgi command
+#
+localcgi() {
+    echo "Content-Type: text/html"
+    echo "X-Header: whatever"
+    echo ""
+
+    echo "<!DOCTYPE HTML> <html> <body> <pre>"
+    env | grep '^\(CONTENT\|DOCUMENT\|GATEWAY\|HTTP\|QUERY\|REMOTE\|REQUEST\|SCRIPT\|SERVER\)_' | sort
+
+    echo "stdin=$(cat)"
+
+    echo "args="
+    local arg
+    for arg do
+        echo "    ${arg}"
+    done
+
+    echo "</pre> </body> </html>"
+}
+
+
+
+#
+# dirindex
+#
+dirindex() {
+    cd "${SCRIPT_FILENAME%/*}" && {
+        local relative_dir="$(echo "/${SCRIPT_NAME}" | sed 's%dirindex$%/%;s%//*%/%g')"
+
+        cat <<-EOH
+	Content-Type: text/html
+
+	<!DOCTYPE HTML> <html> <head> <title>Index of ${relative_dir}</title> </head>
+	<body> <h1>Index of ${relative_dir}</h1>
+	<table> <tr> <th colspan=4><hr/></th> </tr>
+	<tr> <th align=left>Type</th> <th align=left>Name</th> <th align=left>Last Modified</th> <th align=right>Size</th> </tr>
+	EOH
+
+        stat -L "${stat_format}" "<tr> <td>${stat_type}</td> <td><a href=\"${relative_dir}${stat_name}\">${stat_name}</a></td> <td>${stat_modified}</td> <td align=right>${stat_size}</td> </tr>" *
+
+	echo "<tr> <th colspan=4><hr/></th> </tr> </table>"
+	echo "<address>${SERVER_SOFTWARE} ${SERVER_NAME} port ${SERVER_PORT}</address> </body> </html>"
+    }
+}
+
+
+
+#
+# serve files and cgi-bin
+#
+daemon() {
+    clearvars
+    trap cleanup EXIT
+
+    coproc listen 2> >(logstream)
+    debug "pid: ${COPROC_PID} netcat: ${netcat} netstat: ${netstat}"
+    log "listen ${SERVER_PORT} ${root_dir} ${virtual_host}"
+
+    while :; do
+        if [ -n "${CONTENT_LENGTH}" ]; then
+            read -r ${read_time} -d '' -n "${CONTENT_LENGTH}" && {
+                export HTTP_POST_VARS="${REPLY}"
+                REPLY=""
+                post_length=""
+            }
+
+        else
+            read -r ${read_time}
+
+        fi || {
+            setstatus ${time_out_msg}
+            sendresponse
+            continue
+        }
+
+        debug "${REPLY}"
+        REPLY="${REPLY%$'\r'}"
+        read_time="-t ${time_out}"
+
+        case "${REPLY}" in
+            # verb
+            "GET "* | "POST "* | "HEAD "* | "PUT "* | "DELETE "*)
+                log "${REPLY}"
+                setmethod ${REPLY}
+                ;;
+
+            # set host if we're running with virtual hosts
+            "Host: "*)
+                [ -n "${virtual_host}" ] && {
+                    log "${REPLY}"
+                    export HTTP_HOST="${REPLY#* }"
+                    setserver "${HTTP_HOST}"
+                }
+                ;;
+
+            # set CGI variables
+            "Content-Type: "*)
+                setfield "${REPLY}"
+                ;;
+
+            "Accept: "* | \
+            "Accept-Charset: "* | \
+            "Accept-Encoding: "* | \
+            "Accept-Language: "* | \
+            "Cookie: "* | \
+            "User-Agent: "*)
+                setfield "HTTP_${REPLY}"
+                ;;
+
+            "Referer: "*)
+                log "${REPLY}"
+                setfield "HTTP_${REPLY}"
+                ;;
+
+            "Content-Length: "*)
+                [ -n "${no_post}" ] || post_length="${REPLY#* }"
+                ;;
+
+            # end of headers - return the HTTP message
+            "")
+                if [ -n "${post_length}" ]; then
+                    # Still got some data to come
+                    export CONTENT_LENGTH="${post_length}"
+
+                else
+                    parseuri
+                fi
+                ;;
+
+        esac
+    done <&"${COPROC[0]}"
+}
+
+
+
+#
+# listen to port
+#
+listen() {
+    while ${netcat}${SERVER_PORT}; do :; done
+    cleanup quiet
+}
+
+
+
+#
+# clear all the exported variables and set status to unknown error
+#
+clearvars() {
+    unset headers post_length
+    unset CONTENT_LENGTH CONTENT_TYPE
+    unset HTTP_ACCEPT HTTP_ACCEPT_CHARSET HTTP_ACCEPT_ENCODING HTTP_ACCEPT_LANGUAGE
+    unset HTTP_COOKIE HTTP_HOST HTTP_POST_VARS HTTP_REFERER HTTP_USER_AGENT
+    unset REMOTE_ADDR REMOTE_PORT REQUEST_METHOD REQUEST_URI SCRIPT_FILENAME
+
+    export QUERY_STRING=""
+    export SCRIPT_NAME=""
+    export SERVER_PROTOCOL="${default_protocol}"
+
+    setserver "${virtual_host}"
+    setstatus ${unknown_msg}
+    read_time=""
+}
+
+
+
+#
+# set the method variables
+#
+setmethod() {
+    export REQUEST_METHOD="${1}"
+    export REQUEST_URI="${2}"
+    export SERVER_PROTOCOL="${3}"
+}
+
+
+
+#
+# set document root
+#
+setserver() {
+    export SERVER_NAME="${1%%:*}"
+    export DOCUMENT_ROOT="${root_dir}/$(decode ${SERVER_NAME})"
+}
+
+
+
+#
+# set up HTTP status and message
+#
+ok_msg="200 Ok"
+bad_msg="400 Bad Request"
+not_found_msg="404 Not Found"
+time_out_msg="408 Request Timeout"
+teapot_msg="418 I am a Teapot"
+internal_msg="500 Internal Server Error"
+unknown_msg="520 Unknown Error"
+
+setstatus() {
+    status="${1}"
+    shift
+    message="${*}"
+    status_header="${SERVER_PROTOCOL} ${status} ${message}"
+    text="${message}"$'\n'
+    file=""
+
+    [ -n "${error_pages}" ] && {
+        local error_file="${DOCUMENT_ROOT}/${error_pages}${status}.html"
+        [ -f "${error_file}" -a -r "${error_file}" ] && file="${error_file}"
+    }
+}
+
+
+
+#
+# split name and query string and set up output
+#
+parseuri() {
+    if [ -z "${REQUEST_METHOD}" ]; then
+        setstatus ${bad_msg}
+
+    else
+        export SCRIPT_NAME="${REQUEST_URI#/}"
+        SCRIPT_NAME=$(decode "${SCRIPT_NAME%%\?*}")
+        export SCRIPT_FILENAME="${DOCUMENT_ROOT}/${SCRIPT_NAME}"
+
+        [ -n "${index_page}" -a -d "${SCRIPT_FILENAME}" ] && {
+            SCRIPT_FILENAME="${SCRIPT_FILENAME}/${index_page}"
+            SCRIPT_NAME="${SCRIPT_NAME}/${index_page}"
+        }
+
+        case "${SCRIPT_NAME}" in
+            localcgi | *dirindex)
+                runcgi "${SCRIPT_NAME##*/}"
+                ;;
+
+            *${cgi_bin})
+                if [ -x "${SCRIPT_FILENAME}" ]; then
+                    runcgi "${SCRIPT_FILENAME}"
+                else
+                    setfile "${SCRIPT_FILENAME}"
+                fi
+                ;;
+
+            *)
+                setfile "${SCRIPT_FILENAME}"
+                ;;
+        esac
+    fi
+
+    sendresponse
+}
+
+
+
+#
+# decode % sequences
+# replace "/." from path which disallows /../ and .hiddenfile
+#
+decode() {
+    local result="/${1//+/ }"
+    result=$(printf "${result//\%/\\x}" 2>/dev/null)
+    result="${result//\/./${dot_replace}}"
+    echo "${result#/}"
+}
+
+
+
+#
+# run a file
+#
+runcgi() {
+    local name="${1}"
+
+    export QUERY_STRING="${REQUEST_URI}?"
+    QUERY_STRING="${QUERY_STRING#*\?}"
+    QUERY_STRING="${QUERY_STRING%\?}"
+
+    [ -n "${remote}" ] && {
+        local remote_addr_port="$(getremote)"
+        export REMOTE_ADDR="${remote_addr_port%% *}"
+        export REMOTE_PORT="${remote_addr_port##* }"
+    }
+
+    log "run ${name} ${QUERY_STRING}"
+    echo -n "" >"${temp_file}"
+
+    headers="$(echo -n "${HTTP_POST_VARS}" | "${name}" ${QUERY_STRING//+/ } | {
+        while read -r && [ -n "${REPLY}" ]; do
+            echo -n "${REPLY}"$'\r\n'
+        done
+        cat >"${temp_file}"
+    } )"
+
+    case "$?" in
+        0)
+            setstatus ${ok_msg}
+            case "${headers}" in
+                "HTTP/"*)
+                    status_header="${headers%%$'\r'*}"
+                    headers="${headers#*$'\n'}"
+                    ;;
+            esac
+            file="${temp_file}"
+            ;;
+
+        127 | 126)
+            setstatus ${not_found_msg}
+            ;;
+
+        *)
+            setstatus ${internal_msg} $?
+            ;;
+    esac
+}
+
+
+
+#
+# get remote address and port
+#
+getremote() {
+    ${netstat} | \
+    sed -n 's/^ *[^ ]* *[^ ]* *[^ ]* *[^ ]*[\.:]'"${SERVER_PORT}"' *\([^ ]*\)[\.:]\([0-9]*\).*ESTABLISHED$/\1 \2/p'
+}
+
+
+
+#
+# send a file
+#
+setfile() {
+    local name="${1}"
+    log "send ${name}"
+
+    if [ -f "${name}" -a -r "${name}" ]; then
+        setstatus ${ok_msg}
+        file="${name}"
+
+    else
+        setstatus ${not_found_msg}
+    fi
+}
+
+
+
+#
+# send the response
+#
+sendresponse() {
+    log "status ${status_header}"
+
+    [ -n "${debug}" ] && sendhttp "${debug}" >&2
+    sendhttp >&"${COPROC[1]}"
+
+    clearvars
+}
+
+
+
+#
+# send the HTTP
+#
+sendhttp() {
+    echo -ne "${status_header}\r\n"
+    [ -n "${headers}" ] && echo "${headers}"
+    [ -n "${keep_alive}" ] || echo -ne "Connection: close\r\n"
+    [ -n "${server}" ] && echo -ne "Server: ${SERVER_SOFTWARE}\r\n"
+    [ -n "${date}" ] && datefield "Date"
+
+    if [ -n "${file}" ]; then
+        [ -n "${last_modified}" ] && datefield "Last-Modified" "$(stat "${stat_format}" "${stat_modified_secs}" "${file}")"
+
+        [ -n "${content_type}" ] && {
+            local base="${file##*/}"
+            local tag="${base##*.}"
+            [ "x${tag}" = "x${base}" ] || {
+                sed -n '/[ \t]'"${tag}"'/s/^\([^ \t]*\).*/Content-Type: \1\r/p' "${mime_types}"
+            }
+        }
+
+        if [ "HEAD" = "${REQUEST_METHOD}" ]; then
+            echo $'\r'
+        else
+            stat -L "${stat_format}" "Content-Length: ${stat_size}"$'\r\n\r' "${file}"
+            [ -n "${1}" ] || cat "${file}"
+        fi
+
+    else
+        echo -n "Content-Length: ${#text}"$'\r\n\r\n'"${text}"
+    fi
+}
+
+
+
+#
+# Send a date field
+#
+datefield() {
+    local field="${1}"
+    local time="${2}"
+    echo "${field}: $(date -R ${time:+${date_prefix}${time}})"$'\r'
+}
+
+
+
+#
+# set environment argument for CGI
+#
+setfield() {
+    local field="${1%%:*}"
+    field="${field//-/_}"
+    field="${field^^}"
+    export "${field}"="${1#* }"
+}
+
+
+
+#
+# set option
+#
+setoption() {
+    local field="${1#--}"
+    field="${field//-/_}"
+    eval "${field}"="\${2}"
+}
+
+
+
+#
+# pgrep/pkill for status/stop
+#
+pcontrol() {
+    local pcommand="${1}"
+    shift
+
+    ${pcommand} -f "${SHELL} ${0}${*:+ }${*}" | grep -v "^${pid} "
+}
+
+
+#
+# genertate temp file name
+#
+tempname() {
+    echo "${temp_dir}/${whoami}-${pid}"
+}
+
+
+
+#
+# cleanup temp files and group processes
+#
+cleanup() {
+    [ "quiet" = "${1}" ] || log "stop ${SERVER_PORT}"
+    rm -f "$(tempname)"*
+    pkill -g 0
+}
+
+
+
+#
+# echo the argument if we're in debug mode
+#
+debug() {
+    [ -n "${debug}" ] && echo "${*}" 1>&2
+}
+
+
+
+#
+# continuous log
+#
+logstream() {
+    while read -r; do
+        log "${REPLY}"
+    done
+}
+
+
+
+#
+# log arguments
+#
+log() {
+    echo "$(date '+%F %T') ${*}" >&3
+}
+
+
+
+#
+# main
+#
+version="0.1"
+whoami="${0##*/}"
+pid="$$"
+export GATEWAY_INTERFACE="CGI/1.1"
+export SERVER_SOFTWARE="${whoami}/${version} ($(lsb_release --id --short 2>/dev/null || uname -s))"
+export SERVER_PORT=8080
+default_protocol="HTTP/1.1"
+
+temp_dir="/tmp"
+root_dir="/nonexistent"
+cgi_bin="cgi-bin/*"
+error_pages=""
+index_page="index.html"
+dot_replace="/nonexistent"
+mime_types="/etc/mime.types"
+time_out=23
+
+netstat="netstat --tcp -n"
+netcat="nc -lnvk "
+stat_format='--format'
+stat_type='%F'
+stat_name='%n'
+stat_modified='%y'
+stat_modified_secs='%Y'
+stat_size='%s'
+date_prefix='-d @'
+
+
+
+set -o pipefail
+
+while
+    arg="${1}"
+    shift
+    [ -n "${arg}" ]
+do
+    case "${arg}" in
+        stop)
+            pcontrol "pkill" "${@}"
+            exit $?
+            ;;
+
+        status)
+            pcontrol "pgrep -l" "${@}"
+            exit $?
+            ;;
+
+        [0-9]*)
+            SERVER_PORT="${arg}"
+            ;;
+
+        */*)
+            root_dir="${arg}"
+            ;;
+
+        --config)
+            source "${1}"
+            shift
+            ;;
+
+        --virtual-host | --cgi-bin | --error-pages | --index-page | --time-out)
+            setoption "${arg}" "${1}"
+            shift
+            ;;
+
+        --remote | --keep-alive | --no-post | --debug | \
+        --server | --content-type | --last-modified | --date)
+            setoption "${arg}" "1"
+            ;;
+
+        --version)
+            echo "${SERVER_SOFTWARE}"
+            exit 0
+            ;;
+
+        --help | -h | help)
+            usage
+            exit 0
+            ;;
+
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+root_dir="${root_dir%/}"
+temp_file="$(tempname).tmp"
+umask go-rwx
+rm -f "${temp_file}" || exit 1
+touch "${temp_file}" || exit 1
+
+exec 3>&1       # log stream is stdout
+daemon &
